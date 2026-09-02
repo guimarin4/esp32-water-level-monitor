@@ -50,41 +50,6 @@ Current development stage:
 
 > Important: the JSN-SR04T ECHO output can operate at 5 V, while the ESP32 GPIO operates at 3.3 V. A voltage divider is therefore used between the ECHO pin and GPIO 18.
 
-## Voltage Divider
-
-```text
-JSN-SR04T ECHO
-      |
-     1 kΩ
-      |
-      +------ GPIO 18
-      |
-     2 kΩ
-      |
-     GND
-```
-
-## Planned Architecture
-
-```text
-JSN-SR04T
-    |
-    v
-ESP32
-    |
-    +---- Sensor filtering
-    |
-    +---- Water level calculation
-    |
-    +---- Wi-Fi
-             |
-             v
-        Local Web Server
-             |
-             v
-        AJAX / JSON Dashboard
-```
-
 ## Future Improvements
 
 Possible future improvements include:
