@@ -1,6 +1,6 @@
 #include <Arduino.h>
-#include <WiFi.h>
 #include <WebServer.h>
+#include <WiFi.h>
 
 // ======================================================
 // CONFIGURAÇÃO DO WI-FI
@@ -27,8 +27,7 @@ const float DISTANCIA_CHEIA = 15.0;
 const float ALTURA_AGUA = 30.0;
 
 // Distância sensor -> fundo da caixa
-const float DISTANCIA_VAZIA =
-    DISTANCIA_CHEIA + ALTURA_AGUA; // 45 cm
+const float DISTANCIA_VAZIA = DISTANCIA_CHEIA + ALTURA_AGUA;  // 45 cm
 
 // ======================================================
 // SERVIDOR WEB
@@ -51,30 +50,27 @@ bool sensorOK = false;
 // ======================================================
 
 float medirDistancia() {
+    // Garante TRIG em LOW
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
 
-  // Garante TRIG em LOW
-  digitalWrite(TRIG_PIN, LOW);
-  delayMicroseconds(2);
+    // Pulso de 10 us
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
 
-  // Pulso de 10 us
-  digitalWrite(TRIG_PIN, HIGH);
-  delayMicroseconds(10);
-  digitalWrite(TRIG_PIN, LOW);
+    // Mede duração do pulso ECHO
+    unsigned long duracao = pulseIn(ECHO_PIN, HIGH, 30000);
 
-  // Mede duração do pulso ECHO
-  unsigned long duracao =
-      pulseIn(ECHO_PIN, HIGH, 30000);
+    // Timeout
+    if (duracao == 0) {
+        return -1;
+    }
 
-  // Timeout
-  if (duracao == 0) {
-    return -1;
-  }
+    // Velocidade do som ≈ 0.0343 cm/us
+    float distancia = duracao * 0.0343 / 2.0;
 
-  // Velocidade do som ≈ 0.0343 cm/us
-  float distancia =
-      duracao * 0.0343 / 2.0;
-
-  return distancia;
+    return distancia;
 }
 
 // ======================================================
@@ -82,22 +78,18 @@ float medirDistancia() {
 // ======================================================
 
 float calcularNivel(float distancia) {
+    float nivel = ((DISTANCIA_VAZIA - distancia) / ALTURA_AGUA) * 100.0;
 
-  float nivel =
-      ((DISTANCIA_VAZIA - distancia) /
-       ALTURA_AGUA) *
-      100.0;
+    // Limita entre 0 e 100%
+    if (nivel > 100.0) {
+        nivel = 100.0;
+    }
 
-  // Limita entre 0 e 100%
-  if (nivel > 100.0) {
-    nivel = 100.0;
-  }
+    if (nivel < 0.0) {
+        nivel = 0.0;
+    }
 
-  if (nivel < 0.0) {
-    nivel = 0.0;
-  }
-
-  return nivel;
+    return nivel;
 }
 
 // ======================================================
@@ -105,19 +97,17 @@ float calcularNivel(float distancia) {
 // ======================================================
 
 float calcularAlturaAgua(float distancia) {
+    float altura = DISTANCIA_VAZIA - distancia;
 
-  float altura =
-      DISTANCIA_VAZIA - distancia;
+    if (altura > ALTURA_AGUA) {
+        altura = ALTURA_AGUA;
+    }
 
-  if (altura > ALTURA_AGUA) {
-    altura = ALTURA_AGUA;
-  }
+    if (altura < 0.0) {
+        altura = 0.0;
+    }
 
-  if (altura < 0.0) {
-    altura = 0.0;
-  }
-
-  return altura;
+    return altura;
 }
 
 // ======================================================
@@ -973,166 +963,94 @@ setInterval(
 // ======================================================
 
 void setup() {
+    Serial.begin(115200);
 
-  Serial.begin(115200);
+    pinMode(TRIG_PIN, OUTPUT);
 
-  pinMode(
-    TRIG_PIN,
-    OUTPUT
-  );
+    pinMode(ECHO_PIN, INPUT);
 
-  pinMode(
-    ECHO_PIN,
-    INPUT
-  );
+    digitalWrite(TRIG_PIN, LOW);
 
-  digitalWrite(
-    TRIG_PIN,
-    LOW
-  );
+    // ====================================================
+    // WI-FI
+    // ====================================================
 
-  // ====================================================
-  // WI-FI
-  // ====================================================
+    Serial.println();
 
-  Serial.println();
+    Serial.print("Conectando ao Wi-Fi");
 
-  Serial.print(
-    "Conectando ao Wi-Fi"
-  );
+    WiFi.begin(ssid, password);
 
-  WiFi.begin(
-    ssid,
-    password
-  );
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
 
-  while (
-    WiFi.status()
-    !=
-    WL_CONNECTED
-  ) {
-
-    delay(500);
-
-    Serial.print(".");
-
-  }
-
-  Serial.println();
-
-  Serial.println(
-    "Wi-Fi conectado!"
-  );
-
-  Serial.print(
-    "Endereco IP: "
-  );
-
-  Serial.println(
-    WiFi.localIP()
-  );
-
-  // ====================================================
-  // ROTA PRINCIPAL
-  // ====================================================
-
-  server.on(
-    "/",
-    []() {
-
-      server.send_P(
-        200,
-        "text/html",
-        paginaHTML
-      );
-
+        Serial.print(".");
     }
-  );
 
-  // ====================================================
-  // API /dados
-  // ====================================================
+    Serial.println();
 
-  server.on(
-    "/dados",
-    []() {
+    Serial.println("Wi-Fi conectado!");
 
-      String json = "{";
+    Serial.print("Endereco IP: ");
 
-      json +=
-        "\"distancia\":";
+    Serial.println(WiFi.localIP());
 
-      json +=
-        String(
-          distanciaAtual,
-          1
-        );
+    // ====================================================
+    // ROTA PRINCIPAL
+    // ====================================================
 
-      json += ",";
+    server.on("/", []() {
+        server.send_P(200, "text/html", paginaHTML);
+    });
 
-      json +=
-        "\"nivel\":";
+    // ====================================================
+    // API /dados
+    // ====================================================
 
-      json +=
-        String(
-          nivelAtual,
-          1
-        );
+    server.on("/dados", []() {
+        String json = "{";
 
-      json += ",";
+        json += "\"distancia\":";
 
-      json +=
-        "\"altura\":";
+        json += String(distanciaAtual, 1);
 
-      json +=
-        String(
-          alturaAguaAtual,
-          1
-        );
+        json += ",";
 
-      json += ",";
+        json += "\"nivel\":";
 
-      json +=
-        "\"sensor\":";
+        json += String(nivelAtual, 1);
 
-      if (sensorOK) {
+        json += ",";
 
-        json +=
-          "true";
+        json += "\"altura\":";
 
-      } else {
+        json += String(alturaAguaAtual, 1);
 
-        json +=
-          "false";
+        json += ",";
 
-      }
+        json += "\"sensor\":";
 
-      json += "}";
+        if (sensorOK) {
+            json += "true";
 
-      server.sendHeader(
-        "Cache-Control",
-        "no-cache"
-      );
+        } else {
+            json += "false";
+        }
 
-      server.send(
-        200,
-        "application/json",
-        json
-      );
+        json += "}";
 
-    }
-  );
+        server.sendHeader("Cache-Control", "no-cache");
 
-  // ====================================================
-  // INICIA SERVIDOR
-  // ====================================================
+        server.send(200, "application/json", json);
+    });
 
-  server.begin();
+    // ====================================================
+    // INICIA SERVIDOR
+    // ====================================================
 
-  Serial.println(
-    "Servidor WEB iniciado!"
-  );
+    server.begin();
 
+    Serial.println("Servidor WEB iniciado!");
 }
 
 // ======================================================
@@ -1140,103 +1058,57 @@ void setup() {
 // ======================================================
 
 void loop() {
+    // Atende requisições HTTP
+    server.handleClient();
 
-  // Atende requisições HTTP
-  server.handleClient();
+    // Controle não bloqueante
+    static unsigned long ultimaMedicao = 0;
 
-  // Controle não bloqueante
-  static unsigned long
-    ultimaMedicao = 0;
+    // Nova medição a cada 1 segundo
+    if (millis() - ultimaMedicao >= 1000) {
+        ultimaMedicao = millis();
 
-  // Nova medição a cada 1 segundo
-  if (
-    millis()
-    -
-    ultimaMedicao
-    >=
-    1000
-  ) {
+        float distancia = medirDistancia();
 
-    ultimaMedicao =
-      millis();
+        // ==================================================
+        // MEDIÇÃO VÁLIDA
+        // ==================================================
 
-    float distancia =
-      medirDistancia();
+        if (distancia > 0 && distancia < 500) {
+            sensorOK = true;
 
-    // ==================================================
-    // MEDIÇÃO VÁLIDA
-    // ==================================================
+            distanciaAtual = distancia;
 
-    if (
-      distancia > 0
-      &&
-      distancia < 500
-    ) {
+            nivelAtual = calcularNivel(distancia);
 
-      sensorOK = true;
+            alturaAguaAtual = calcularAlturaAgua(distancia);
 
-      distanciaAtual =
-        distancia;
+            // Serial Monitor
 
-      nivelAtual =
-        calcularNivel(
-          distancia
-        );
+            Serial.print("Distancia: ");
 
-      alturaAguaAtual =
-        calcularAlturaAgua(
-          distancia
-        );
+            Serial.print(distanciaAtual, 1);
 
-      // Serial Monitor
+            Serial.print(" cm | Altura: ");
 
-      Serial.print(
-        "Distancia: "
-      );
+            Serial.print(alturaAguaAtual, 1);
 
-      Serial.print(
-        distanciaAtual,
-        1
-      );
+            Serial.print(" cm | Nivel: ");
 
-      Serial.print(
-        " cm | Altura: "
-      );
+            Serial.print(nivelAtual, 1);
 
-      Serial.print(
-        alturaAguaAtual,
-        1
-      );
+            Serial.println(" %");
 
-      Serial.print(
-        " cm | Nivel: "
-      );
+        }
 
-      Serial.print(
-        nivelAtual,
-        1
-      );
+        // ==================================================
+        // ERRO
+        // ==================================================
 
-      Serial.println(
-        " %"
-      );
+        else {
+            sensorOK = false;
 
+            Serial.println("Erro na leitura do sensor");
+        }
     }
-
-    // ==================================================
-    // ERRO
-    // ==================================================
-
-    else {
-
-      sensorOK = false;
-
-      Serial.println(
-        "Erro na leitura do sensor"
-      );
-
-    }
-
-  }
-
 }
