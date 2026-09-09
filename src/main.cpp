@@ -1,13 +1,16 @@
 #include <Arduino.h>
+#include <EMailSender.h>
 #include <WebServer.h>
 #include <WiFi.h>
 
+#include "secrets.h"
+
 // ======================================================
-// CONFIGURAÇÃO DO WI-FI
+// WI-FI
 // ======================================================
 
-const char* ssid = "LIGGA-MARIN-2.4G";
-const char* password = "@Bodasdeprata25";
+const char* ssid = WIFI_SSID;
+const char* password = WIFI_PASSWORD;
 
 // ======================================================
 // PINOS DO JSN-SR04T
@@ -20,20 +23,54 @@ const char* password = "@Bodasdeprata25";
 // CONFIGURAÇÃO DA CAIXA
 // ======================================================
 
-// Distância entre o sensor e a água quando a caixa está cheia
+// Distância sensor -> água quando cheia
 const float DISTANCIA_CHEIA = 15.0;
 
-// Altura máxima da coluna de água
+// Altura útil máxima da água
 const float ALTURA_AGUA = 30.0;
 
-// Distância sensor -> fundo da caixa
+// Sensor -> fundo
 const float DISTANCIA_VAZIA = DISTANCIA_CHEIA + ALTURA_AGUA;  // 45 cm
+
+// ======================================================
+// CONFIGURAÇÃO DE MONITORAMENTO
+// ======================================================
+
+// Uma medição a cada 30 segundos
+const unsigned long INTERVALO_MEDICAO = 30000;
+
+// Leituras acima disso são consideradas suspeitas
+const float DISTANCIA_ESTRANHA = 200.0;
+
+// Número de leituras suspeitas consecutivas necessárias
+// para assumir que a água está na zona cega do sensor
+const int LIMITE_LEITURAS_ESTRANHAS = 3;
+
+// Alerta de nível baixo
+const float NIVEL_ALERTA = 50.0;
+
+// Rearma o alerta somente depois de voltar para 55%
+const float NIVEL_REARME_EMAIL = 55.0;
 
 // ======================================================
 // SERVIDOR WEB
 // ======================================================
 
 WebServer server(80);
+
+// ======================================================
+// ESTADOS DO SENSOR
+// ======================================================
+
+enum EstadoSensor {
+    ESTADO_INICIANDO,
+    ESTADO_OK,
+    ESTADO_SUSPEITA,
+    ESTADO_CHEIO_ESTIMADO,
+    ESTADO_ERRO
+};
+
+EstadoSensor estadoSensor = ESTADO_INICIANDO;
 
 // ======================================================
 // VARIÁVEIS
@@ -43,26 +80,60 @@ float distanciaAtual = 0.0;
 float nivelAtual = 0.0;
 float alturaAguaAtual = 0.0;
 
-bool sensorOK = false;
+bool dadosDisponiveis = false;
+
+int leiturasEstranhas = 0;
+
+bool emailAlertaEnviado = false;
+
+unsigned long ultimaMedicaoMillis = 0;
+
+// ======================================================
+// CONFIGURAÇÃO DO E-MAIL
+// ======================================================
+
+EMailSender emailSend(EMAIL_REMETENTE, EMAIL_APP_PASSWORD, EMAIL_REMETENTE, "Water Tank Monitor",
+                      "smtp.gmail.com", 587);
+
+// ======================================================
+// CONVERTER ESTADO PARA TEXTO
+// ======================================================
+
+const char* estadoParaTexto() {
+    switch (estadoSensor) {
+        case ESTADO_OK:
+            return "ok";
+
+        case ESTADO_SUSPEITA:
+            return "suspeita";
+
+        case ESTADO_CHEIO_ESTIMADO:
+            return "estimado";
+
+        case ESTADO_ERRO:
+            return "erro";
+
+        default:
+            return "iniciando";
+    }
+}
 
 // ======================================================
 // MEDIR DISTÂNCIA
 // ======================================================
 
 float medirDistancia() {
-    // Garante TRIG em LOW
     digitalWrite(TRIG_PIN, LOW);
     delayMicroseconds(2);
 
-    // Pulso de 10 us
     digitalWrite(TRIG_PIN, HIGH);
     delayMicroseconds(10);
+
     digitalWrite(TRIG_PIN, LOW);
 
-    // Mede duração do pulso ECHO
     unsigned long duracao = pulseIn(ECHO_PIN, HIGH, 30000);
 
-    // Timeout
+    // Nenhum eco recebido
     if (duracao == 0) {
         return -1;
     }
@@ -80,7 +151,6 @@ float medirDistancia() {
 float calcularNivel(float distancia) {
     float nivel = ((DISTANCIA_VAZIA - distancia) / ALTURA_AGUA) * 100.0;
 
-    // Limita entre 0 e 100%
     if (nivel > 100.0) {
         nivel = 100.0;
     }
@@ -111,13 +181,213 @@ float calcularAlturaAgua(float distancia) {
 }
 
 // ======================================================
-// PÁGINA WEB
+// ENVIAR E-MAIL
+// ======================================================
+
+bool enviarEmailNivelBaixo() {
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Nao foi possivel enviar e-mail: Wi-Fi desconectado.");
+
+        return false;
+    }
+
+    Serial.println();
+    Serial.println("Enviando alerta por e-mail...");
+
+    EMailSender::EMailMessage mensagem;
+
+    mensagem.subject = "Alerta - Nivel baixo da caixa d'agua";
+
+    String corpo = "Water Tank Monitor\n\n";
+
+    corpo += "O nivel da caixa d'agua esta abaixo de 50%.\n\n";
+
+    corpo += "Nivel atual: ";
+
+    corpo += String(nivelAtual, 1);
+
+    corpo += "%\n";
+
+    corpo += "Altura da agua: ";
+
+    corpo += String(alturaAguaAtual, 1);
+
+    corpo += " cm\n";
+
+    corpo += "Distancia medida: ";
+
+    corpo += String(distanciaAtual, 1);
+
+    corpo += " cm\n";
+
+    mensagem.message = corpo;
+
+    EMailSender::Response resposta = emailSend.send(EMAIL_DESTINO, mensagem);
+
+    Serial.print("Codigo SMTP: ");
+    Serial.println(resposta.code);
+
+    Serial.print("Resposta: ");
+    Serial.println(resposta.desc);
+
+    Serial.print("Status: ");
+    Serial.println(resposta.status ? "SUCESSO" : "ERRO");
+
+    return resposta.status;
+}
+
+// ======================================================
+// VERIFICAR ALERTA DE NÍVEL
+// ======================================================
+
+void verificarAlertaEmail() {
+    // ==================================================
+    // REARME
+    // ==================================================
+
+    if (nivelAtual >= NIVEL_REARME_EMAIL && emailAlertaEnviado) {
+        emailAlertaEnviado = false;
+
+        Serial.println(
+            "Nivel voltou acima de 55%. "
+            "Alerta de e-mail rearmado.");
+    }
+
+    // ==================================================
+    // ALERTA
+    // ==================================================
+
+    if (nivelAtual < NIVEL_ALERTA && !emailAlertaEnviado) {
+        Serial.println("Nivel abaixo de 50%.");
+
+        bool enviado = enviarEmailNivelBaixo();
+
+        if (enviado) {
+            emailAlertaEnviado = true;
+
+            Serial.println("Alerta enviado com sucesso.");
+
+        } else {
+            Serial.println("Falha no envio do alerta.");
+        }
+    }
+}
+
+// ======================================================
+// EXECUTAR MEDIÇÃO
+// ======================================================
+
+void executarMedicao() {
+    ultimaMedicaoMillis = millis();
+
+    float distancia = medirDistancia();
+
+    Serial.println();
+    Serial.println("============================");
+    Serial.println("Nova medicao");
+
+    // ==================================================
+    // LEITURA NORMAL
+    // ==================================================
+
+    if (distancia > 0 && distancia <= DISTANCIA_ESTRANHA) {
+        leiturasEstranhas = 0;
+
+        estadoSensor = ESTADO_OK;
+
+        dadosDisponiveis = true;
+
+        distanciaAtual = distancia;
+
+        nivelAtual = calcularNivel(distancia);
+
+        alturaAguaAtual = calcularAlturaAgua(distancia);
+
+        Serial.print("Distancia: ");
+        Serial.print(distanciaAtual, 1);
+        Serial.println(" cm");
+
+        Serial.print("Altura agua: ");
+        Serial.print(alturaAguaAtual, 1);
+        Serial.println(" cm");
+
+        Serial.print("Nivel: ");
+        Serial.print(nivelAtual, 1);
+        Serial.println(" %");
+
+        verificarAlertaEmail();
+
+        return;
+    }
+
+    // ==================================================
+    // LEITURA MUITO ALTA
+    // ==================================================
+
+    if (distancia > DISTANCIA_ESTRANHA) {
+        leiturasEstranhas++;
+
+        estadoSensor = ESTADO_SUSPEITA;
+
+        distanciaAtual = distancia;
+
+        Serial.print("Leitura suspeita: ");
+
+        Serial.print(distancia, 1);
+
+        Serial.println(" cm");
+
+        Serial.print("Contagem: ");
+
+        Serial.print(leiturasEstranhas);
+
+        Serial.print("/");
+
+        Serial.println(LIMITE_LEITURAS_ESTRANHAS);
+
+        // ==============================================
+        // TRÊS LEITURAS SUSPEITAS CONSECUTIVAS
+        // ==============================================
+
+        if (leiturasEstranhas >= LIMITE_LEITURAS_ESTRANHAS) {
+            estadoSensor = ESTADO_CHEIO_ESTIMADO;
+
+            dadosDisponiveis = true;
+
+            nivelAtual = 100.0;
+
+            alturaAguaAtual = ALTURA_AGUA;
+
+            Serial.println("Caixa considerada CHEIA.");
+
+            Serial.println("Nivel = 100% (estimado)");
+
+            // Se anteriormente houve alerta,
+            // 100% rearma o sistema
+            verificarAlertaEmail();
+        }
+
+        return;
+    }
+
+    // ==================================================
+    // TIMEOUT / SEM ECO
+    // ==================================================
+
+    estadoSensor = ESTADO_ERRO;
+
+    leiturasEstranhas = 0;
+
+    Serial.println("ERRO: nenhum eco recebido.");
+}
+
+// ======================================================
+// PÁGINA HTML
 // ======================================================
 
 const char paginaHTML[] PROGMEM = R"rawliteral(
 
 <!DOCTYPE html>
-
 <html lang="pt-BR">
 
 <head>
@@ -138,19 +408,14 @@ const char paginaHTML[] PROGMEM = R"rawliteral(
 }
 
 body {
-
   margin: 0;
-
   min-height: 100vh;
 
   display: flex;
-  align-items: center;
   justify-content: center;
+  align-items: center;
 
-  font-family:
-    Arial,
-    Helvetica,
-    sans-serif;
+  font-family: Arial, Helvetica, sans-serif;
 
   background:
     linear-gradient(
@@ -162,128 +427,84 @@ body {
   color: white;
 }
 
-/* ============================== */
-/* CONTAINER PRINCIPAL            */
-/* ============================== */
-
 .dashboard {
-
   width: 92%;
   max-width: 850px;
 
+  padding: 35px;
+
   background:
-    rgba(
-      255,
-      255,
-      255,
-      0.07
-    );
+    rgba(255,255,255,0.07);
 
   border:
     1px solid
-    rgba(
-      255,
-      255,
-      255,
-      0.12
-    );
+    rgba(255,255,255,0.12);
 
   border-radius: 24px;
 
-  padding: 35px;
-
   box-shadow:
     0 20px 60px
-    rgba(0, 0, 0, 0.35);
-
+    rgba(0,0,0,0.35);
 }
 
-/* ============================== */
-/* CABEÇALHO                      */
-/* ============================== */
-
 .header {
-
   display: flex;
+
   justify-content: space-between;
   align-items: center;
 
   margin-bottom: 35px;
-
 }
 
 .title h1 {
-
   margin: 0;
-
   font-size: 28px;
-
 }
 
 .title p {
-
   margin-top: 5px;
-
   color: #94a3b8;
-
 }
 
-/* ============================== */
-/* STATUS DO SENSOR               */
-/* ============================== */
-
 .status {
+  padding: 9px 15px;
 
-  padding:
-    8px 14px;
+  border-radius: 20px;
 
-  border-radius:
-    20px;
+  font-size: 14px;
 
-  font-size:
-    14px;
-
-  background:
-    #334155;
-
+  background: #334155;
 }
 
 .status.ok {
-
   background:
-    rgba(
-      34,
-      197,
-      94,
-      0.2
-    );
+    rgba(34,197,94,0.2);
 
-  color:
-    #4ade80;
+  color: #4ade80;
+}
 
+.status.warning {
+  background:
+    rgba(245,158,11,0.2);
+
+  color: #fbbf24;
 }
 
 .status.error {
-
   background:
-    rgba(
-      239,
-      68,
-      68,
-      0.2
-    );
+    rgba(239,68,68,0.2);
 
-  color:
-    #f87171;
-
+  color: #f87171;
 }
 
-/* ============================== */
-/* ÁREA PRINCIPAL                 */
-/* ============================== */
+.status.estimated {
+  background:
+    rgba(56,189,248,0.2);
+
+  color: #38bdf8;
+}
 
 .content {
-
   display: grid;
 
   grid-template-columns:
@@ -292,70 +513,42 @@ body {
   gap: 50px;
 
   align-items: center;
-
 }
 
-/* ============================== */
-/* TANQUE                         */
-/* ============================== */
-
 .tank-wrapper {
-
   display: flex;
   justify-content: center;
   align-items: center;
-
 }
 
 .tank {
-
   position: relative;
 
   width: 180px;
   height: 300px;
 
   border:
-    5px solid
-    #cbd5e1;
+    5px solid #cbd5e1;
 
   border-radius:
-    12px 12px
-    30px 30px;
+    12px 12px 30px 30px;
 
   overflow: hidden;
 
   background:
-    rgba(
-      255,
-      255,
-      255,
-      0.05
-    );
+    rgba(255,255,255,0.05);
 
   box-shadow:
     inset 0 0 20px
-    rgba(
-      0,
-      0,
-      0,
-      0.4
-    );
-
+    rgba(0,0,0,0.4);
 }
 
-/* ============================== */
-/* ÁGUA                           */
-/* ============================== */
-
 .water {
-
-  position:
-    absolute;
+  position: absolute;
 
   bottom: 0;
 
   width: 100%;
-
   height: 0%;
 
   background:
@@ -368,17 +561,12 @@ body {
   transition:
     height 0.8s ease,
     background 0.5s ease;
-
 }
 
-/* efeito de brilho */
-
 .water::before {
-
   content: "";
 
-  position:
-    absolute;
+  position: absolute;
 
   top: 0;
   left: 0;
@@ -387,219 +575,146 @@ body {
   height: 6px;
 
   background:
-    rgba(
-      255,
-      255,
-      255,
-      0.45
-    );
-
+    rgba(255,255,255,0.45);
 }
 
-/* ============================== */
-/* PORCENTAGEM NO TANQUE          */
-/* ============================== */
-
 .level-text {
-
-  position:
-    absolute;
+  position: absolute;
 
   top: 50%;
   left: 50%;
 
   transform:
-    translate(
-      -50%,
-      -50%
-    );
+    translate(-50%, -50%);
 
   z-index: 5;
 
-  font-size:
-    36px;
+  font-size: 36px;
 
-  font-weight:
-    bold;
+  font-weight: bold;
 
   text-shadow:
     0 2px 8px
-    rgba(
-      0,
-      0,
-      0,
-      0.8
-    );
-
+    rgba(0,0,0,0.8);
 }
 
-/* ============================== */
-/* DADOS                          */
-/* ============================== */
-
 .data-area h2 {
-
   margin-top: 0;
 
-  font-size:
-    22px;
+  font-size: 22px;
 
-  color:
-    #cbd5e1;
-
+  color: #cbd5e1;
 }
 
 .main-level {
+  font-size: 70px;
 
-  font-size:
-    70px;
+  font-weight: bold;
 
-  font-weight:
-    bold;
-
-  margin-bottom:
-    25px;
-
+  margin-bottom: 25px;
 }
 
 .cards {
-
-  display:
-    grid;
+  display: grid;
 
   grid-template-columns:
-    repeat(
-      2,
-      1fr
-    );
+    repeat(2, 1fr);
 
-  gap:
-    15px;
-
+  gap: 15px;
 }
 
 .card {
+  padding: 18px;
 
-  padding:
-    18px;
-
-  border-radius:
-    16px;
+  border-radius: 16px;
 
   background:
-    rgba(
-      255,
-      255,
-      255,
-      0.06
-    );
-
+    rgba(255,255,255,0.06);
 }
 
 .card-title {
+  color: #94a3b8;
 
-  color:
-    #94a3b8;
+  font-size: 13px;
 
-  font-size:
-    13px;
-
-  margin-bottom:
-    8px;
-
+  margin-bottom: 8px;
 }
 
 .card-value {
+  font-size: 20px;
 
-  font-size:
-    22px;
-
-  font-weight:
-    bold;
-
+  font-weight: bold;
 }
 
-/* ============================== */
-/* RODAPÉ                         */
-/* ============================== */
+.restart-button {
+  display: block;
+
+  margin: 30px auto 0;
+
+  padding: 12px 22px;
+
+  border: none;
+
+  border-radius: 10px;
+
+  background: #334155;
+
+  color: white;
+
+  cursor: pointer;
+
+  font-size: 14px;
+
+  transition:
+    background 0.2s;
+}
+
+.restart-button:hover {
+  background: #475569;
+}
 
 .footer {
+  margin-top: 25px;
 
-  margin-top:
-    30px;
+  text-align: center;
 
-  text-align:
-    center;
+  color: #64748b;
 
-  color:
-    #64748b;
-
-  font-size:
-    13px;
-
+  font-size: 13px;
 }
 
-/* ============================== */
-/* RESPONSIVO                     */
-/* ============================== */
-
-@media
-(max-width: 650px) {
+@media(max-width: 650px) {
 
   .dashboard {
-
-    padding:
-      25px;
-
+    padding: 25px;
   }
 
   .header {
+    flex-direction: column;
 
-    flex-direction:
-      column;
+    align-items: flex-start;
 
-    align-items:
-      flex-start;
-
-    gap:
-      15px;
-
+    gap: 15px;
   }
 
   .content {
-
-    grid-template-columns:
-      1fr;
-
-  }
-
-  .main-level {
-
-    text-align:
-      center;
-
-    font-size:
-      55px;
-
-  }
-
-  .cards {
-
-    grid-template-columns:
-      1fr;
-
+    grid-template-columns: 1fr;
   }
 
   .tank {
-
-    width:
-      150px;
-
-    height:
-      250px;
-
+    width: 150px;
+    height: 250px;
   }
 
+  .main-level {
+    text-align: center;
+
+    font-size: 55px;
+  }
+
+  .cards {
+    grid-template-columns: 1fr;
+  }
 }
 
 </style>
@@ -609,8 +724,6 @@ body {
 <body>
 
 <div class="dashboard">
-
-  <!-- HEADER -->
 
   <div class="header">
 
@@ -630,19 +743,13 @@ body {
       id="status"
       class="status"
     >
-
-      Conectando...
-
+      Iniciando...
     </div>
 
   </div>
 
 
-  <!-- CONTEÚDO -->
-
   <div class="content">
-
-    <!-- TANQUE -->
 
     <div class="tank-wrapper">
 
@@ -658,17 +765,13 @@ body {
           id="tankLevel"
           class="level-text"
         >
-
           --%
-
         </div>
 
       </div>
 
     </div>
 
-
-    <!-- DADOS -->
 
     <div class="data-area">
 
@@ -680,9 +783,7 @@ body {
         id="mainLevel"
         class="main-level"
       >
-
         --%
-
       </div>
 
 
@@ -698,9 +799,7 @@ body {
             id="waterHeight"
             class="card-value"
           >
-
             -- cm
-
           </div>
 
         </div>
@@ -716,9 +815,7 @@ body {
             id="distance"
             class="card-value"
           >
-
             -- cm
-
           </div>
 
         </div>
@@ -727,34 +824,30 @@ body {
         <div class="card">
 
           <div class="card-title">
-            CAPACIDADE
+            ÚLTIMA MEDIÇÃO
           </div>
 
           <div
-            id="capacity"
+            id="lastMeasurement"
             class="card-value"
           >
-
-            -- %
-
-          </div>
-
-        </div>
-
-
-        <div class="card">
-
-          <div class="card-title">
-            ÚLTIMA ATUALIZAÇÃO
-          </div>
-
-          <div
-            id="update"
-            class="card-value"
-          >
-
             --
+          </div>
 
+        </div>
+
+
+        <div class="card">
+
+          <div class="card-title">
+            ALERTA DE E-MAIL
+          </div>
+
+          <div
+            id="emailStatus"
+            class="card-value"
+          >
+            --
           </div>
 
         </div>
@@ -766,10 +859,16 @@ body {
   </div>
 
 
+  <button
+    class="restart-button"
+    onclick="reiniciarESP()"
+  >
+    Reiniciar ESP32
+  </button>
+
+
   <div class="footer">
-
     ESP32 Water Level Monitoring System
-
   </div>
 
 </div>
@@ -778,7 +877,7 @@ body {
 <script>
 
 // ======================================================
-// DEFINIR COR COM BASE NO NÍVEL
+// COR DO NÍVEL
 // ======================================================
 
 function atualizarCor(nivel) {
@@ -816,19 +915,84 @@ function atualizarCor(nivel) {
 
     nivelPrincipal.style.color =
       "#38bdf8";
-
   }
-
 }
 
 
 // ======================================================
-// BUSCAR DADOS DO ESP32
+// STATUS
+// ======================================================
+
+function atualizarStatus(data) {
+
+  const status =
+    document.getElementById("status");
+
+  if (data.estado === "ok") {
+
+    status.innerHTML =
+      "● Sensor OK";
+
+    status.className =
+      "status ok";
+
+  }
+
+  else if (data.estado === "suspeita") {
+
+    status.innerHTML =
+      "● Leitura suspeita "
+      + data.leiturasEstranhas
+      + "/3";
+
+    status.className =
+      "status warning";
+
+  }
+
+  else if (data.estado === "estimado") {
+
+    status.innerHTML =
+      "● Caixa cheia (estimado)";
+
+    status.className =
+      "status estimated";
+
+  }
+
+  else if (data.estado === "erro") {
+
+    status.innerHTML =
+      "● Erro no sensor";
+
+    status.className =
+      "status error";
+
+  }
+
+  else {
+
+    status.innerHTML =
+      "Iniciando...";
+
+    status.className =
+      "status";
+  }
+}
+
+
+// ======================================================
+// BUSCAR DADOS
 // ======================================================
 
 function atualizarDados() {
 
-  fetch("/dados")
+  fetch(
+    "/dados",
+    {
+      cache: "no-store"
+    }
+  )
 
   .then(
     response =>
@@ -838,22 +1002,13 @@ function atualizarDados() {
   .then(
     data => {
 
-      const status =
-        document.getElementById(
-          "status"
-        );
+      atualizarStatus(data);
 
-      // ==========================
-      // SENSOR OK
-      // ==========================
+      // =================================================
+      // DADOS DISPONÍVEIS
+      // =================================================
 
-      if (data.sensor) {
-
-        status.innerHTML =
-          "● Sensor OK";
-
-        status.className =
-          "status ok";
+      if (data.temDados) {
 
         const nivel =
           data.nivel;
@@ -877,45 +1032,49 @@ function atualizarDados() {
           + "%";
 
         document.getElementById(
-          "distance"
-        ).innerHTML =
-          data.distancia.toFixed(1)
-          + " cm";
-
-        document.getElementById(
           "waterHeight"
         ).innerHTML =
           data.altura.toFixed(1)
           + " cm";
 
         document.getElementById(
-          "capacity"
+          "distance"
         ).innerHTML =
-          nivel.toFixed(1)
-          + " %";
-
-        document.getElementById(
-          "update"
-        ).innerHTML =
-          new Date()
-          .toLocaleTimeString();
+          data.distancia.toFixed(1)
+          + " cm";
 
         atualizarCor(nivel);
-
       }
 
-      // ==========================
-      // ERRO DO SENSOR
-      // ==========================
 
-      else {
+      // =================================================
+      // ÚLTIMA MEDIÇÃO
+      // =================================================
 
-        status.innerHTML =
-          "● Erro no sensor";
+      document.getElementById(
+        "lastMeasurement"
+      ).innerHTML =
+        data.segundosDesdeMedicao
+        + " s atrás";
 
-        status.className =
-          "status error";
 
+      // =================================================
+      // E-MAIL
+      // =================================================
+
+      if (data.emailEnviado) {
+
+        document.getElementById(
+          "emailStatus"
+        ).innerHTML =
+          "Alerta enviado";
+
+      } else {
+
+        document.getElementById(
+          "emailStatus"
+        ).innerHTML =
+          "Monitorando";
       }
 
     }
@@ -937,17 +1096,65 @@ function atualizarDados() {
 
     }
   );
+}
+
+
+// ======================================================
+// REINICIAR ESP32
+// ======================================================
+
+function reiniciarESP() {
+
+  const confirmar =
+    confirm(
+      "Deseja realmente reiniciar o ESP32?"
+    );
+
+  if (!confirmar) {
+    return;
+  }
+
+  const status =
+    document.getElementById(
+      "status"
+    );
+
+  status.innerHTML =
+    "Reiniciando...";
+
+  status.className =
+    "status warning";
+
+
+  fetch(
+    "/restart",
+    {
+      method: "POST"
+    }
+  )
+
+  .then(() => {
+
+    setTimeout(
+      () => {
+        location.reload();
+      },
+      5000
+    );
+
+  });
 
 }
 
 
-// Executa imediatamente
+// Busca imediatamente
 atualizarDados();
 
-// Atualiza a cada 1 segundo
+// Página consulta o ESP32 a cada 2 segundos.
+// Isso NÃO significa que o sensor mede a cada 2 segundos.
 setInterval(
   atualizarDados,
-  1000
+  2000
 );
 
 </script>
@@ -959,56 +1166,28 @@ setInterval(
 )rawliteral";
 
 // ======================================================
-// SETUP
+// CONFIGURAR ROTAS DO SERVIDOR
 // ======================================================
 
-void setup() {
-    Serial.begin(115200);
+void configurarServidor() {
+    // ==================================================
+    // PÁGINA PRINCIPAL
+    // ==================================================
 
-    pinMode(TRIG_PIN, OUTPUT);
+    server.on("/", HTTP_GET, []() { server.send_P(200, "text/html", paginaHTML); });
 
-    pinMode(ECHO_PIN, INPUT);
+    // ==================================================
+    // DADOS JSON
+    // ==================================================
 
-    digitalWrite(TRIG_PIN, LOW);
+    server.on("/dados", HTTP_GET, []() {
+        unsigned long segundosDesdeMedicao = (millis() - ultimaMedicaoMillis) / 1000;
 
-    // ====================================================
-    // WI-FI
-    // ====================================================
+        String json;
 
-    Serial.println();
+        json.reserve(300);
 
-    Serial.print("Conectando ao Wi-Fi");
-
-    WiFi.begin(ssid, password);
-
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-
-        Serial.print(".");
-    }
-
-    Serial.println();
-
-    Serial.println("Wi-Fi conectado!");
-
-    Serial.print("Endereco IP: ");
-
-    Serial.println(WiFi.localIP());
-
-    // ====================================================
-    // ROTA PRINCIPAL
-    // ====================================================
-
-    server.on("/", []() {
-        server.send_P(200, "text/html", paginaHTML);
-    });
-
-    // ====================================================
-    // API /dados
-    // ====================================================
-
-    server.on("/dados", []() {
-        String json = "{";
+        json += "{";
 
         json += "\"distancia\":";
 
@@ -1028,29 +1207,116 @@ void setup() {
 
         json += ",";
 
-        json += "\"sensor\":";
+        json += "\"estado\":\"";
 
-        if (sensorOK) {
-            json += "true";
+        json += estadoParaTexto();
 
-        } else {
-            json += "false";
-        }
+        json += "\",";
+
+        json += "\"temDados\":";
+
+        json += (dadosDisponiveis ? "true" : "false");
+
+        json += ",";
+
+        json += "\"leiturasEstranhas\":";
+
+        json += String(leiturasEstranhas);
+
+        json += ",";
+
+        json += "\"segundosDesdeMedicao\":";
+
+        json += String(segundosDesdeMedicao);
+
+        json += ",";
+
+        json += "\"emailEnviado\":";
+
+        json += (emailAlertaEnviado ? "true" : "false");
 
         json += "}";
 
-        server.sendHeader("Cache-Control", "no-cache");
+        server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
 
         server.send(200, "application/json", json);
     });
 
-    // ====================================================
-    // INICIA SERVIDOR
-    // ====================================================
+    // ==================================================
+    // REINICIAR ESP32
+    // ==================================================
+
+    server.on("/restart", HTTP_POST, []() {
+        Serial.println();
+        Serial.println("Reinicio solicitado pela pagina WEB.");
+
+        server.send(200, "text/plain", "Reiniciando ESP32...");
+
+        delay(500);
+
+        ESP.restart();
+    });
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+    Serial.begin(115200);
+
+    pinMode(TRIG_PIN, OUTPUT);
+
+    pinMode(ECHO_PIN, INPUT);
+
+    digitalWrite(TRIG_PIN, LOW);
+
+    // ==================================================
+    // WI-FI
+    // ==================================================
+
+    WiFi.mode(WIFI_STA);
+
+    // Não grava constantemente configuração na flash
+    WiFi.persistent(false);
+
+    // Tenta reconectar automaticamente
+    WiFi.setAutoReconnect(true);
+
+    Serial.println();
+    Serial.print("Conectando ao Wi-Fi");
+
+    WiFi.begin(ssid, password);
+
+    while (WiFi.status() != WL_CONNECTED) {
+        delay(500);
+
+        Serial.print(".");
+    }
+
+    Serial.println();
+    Serial.println("Wi-Fi conectado!");
+
+    Serial.print("Endereco IP: ");
+
+    Serial.println(WiFi.localIP());
+
+    // ==================================================
+    // SERVIDOR
+    // ==================================================
+
+    configurarServidor();
 
     server.begin();
 
     Serial.println("Servidor WEB iniciado!");
+
+    // ==================================================
+    // PRIMEIRA MEDIÇÃO
+    // ==================================================
+
+    // Não espera 30 segundos após ligar.
+    executarMedicao();
 }
 
 // ======================================================
@@ -1058,57 +1324,14 @@ void setup() {
 // ======================================================
 
 void loop() {
-    // Atende requisições HTTP
+    // Mantém o servidor WEB respondendo continuamente
     server.handleClient();
 
-    // Controle não bloqueante
-    static unsigned long ultimaMedicao = 0;
+    // ==================================================
+    // MEDIÇÃO A CADA 30 SEGUNDOS
+    // ==================================================
 
-    // Nova medição a cada 1 segundo
-    if (millis() - ultimaMedicao >= 1000) {
-        ultimaMedicao = millis();
-
-        float distancia = medirDistancia();
-
-        // ==================================================
-        // MEDIÇÃO VÁLIDA
-        // ==================================================
-
-        if (distancia > 0 && distancia < 500) {
-            sensorOK = true;
-
-            distanciaAtual = distancia;
-
-            nivelAtual = calcularNivel(distancia);
-
-            alturaAguaAtual = calcularAlturaAgua(distancia);
-
-            // Serial Monitor
-
-            Serial.print("Distancia: ");
-
-            Serial.print(distanciaAtual, 1);
-
-            Serial.print(" cm | Altura: ");
-
-            Serial.print(alturaAguaAtual, 1);
-
-            Serial.print(" cm | Nivel: ");
-
-            Serial.print(nivelAtual, 1);
-
-            Serial.println(" %");
-
-        }
-
-        // ==================================================
-        // ERRO
-        // ==================================================
-
-        else {
-            sensorOK = false;
-
-            Serial.println("Erro na leitura do sensor");
-        }
+    if (millis() - ultimaMedicaoMillis >= INTERVALO_MEDICAO) {
+        executarMedicao();
     }
 }
