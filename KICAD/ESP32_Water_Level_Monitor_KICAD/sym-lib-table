@@ -1,0 +1,4 @@
+(sym_lib_table
+  (version 7)
+  (lib (name "ESP32_38Pin_Symbol")(type "KiCad")(uri "${KIPRJMOD}/KiCad-ESP32-CP2102-38Pin-main/ESP32_38Pin_Symbol.kicad_sym")(options "")(descr ""))
+)
