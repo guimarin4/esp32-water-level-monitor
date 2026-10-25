@@ -451,7 +451,7 @@
     "pinned_symbol_libs": []
   },
   "meta": {
-    "filename": "KICAD.kicad_pro",
+    "filename": "ESP32_Water_Level_Monitor_KICAD.kicad_pro",
     "version": 3
   },
   "net_settings": {
