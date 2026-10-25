@@ -4,6 +4,7 @@
 #include <WiFi.h>
 
 #include "secrets.h"
+#include "measurement_filter.h"
 
 // ======================================================
 // WI-FI
@@ -36,15 +37,22 @@ const float DISTANCIA_VAZIA = DISTANCIA_CHEIA + ALTURA_AGUA;  // 45 cm
 // CONFIGURAÇÃO DE MONITORAMENTO
 // ======================================================
 
-// Uma medição a cada 30 segundos
-const unsigned long INTERVALO_MEDICAO = 30000;
+// Uma medição a cada 2 segundos para facilitar os testes.
+const unsigned long INTERVALO_MEDICAO = 2000;
 
-// Leituras acima disso são consideradas suspeitas
-const float DISTANCIA_ESTRANHA = 200.0;
+// Desativa o envio de e-mails durante os testes.
+const bool EMAIL_HABILITADO = false;
 
-// Número de leituras suspeitas consecutivas necessárias
-// para assumir que a água está na zona cega do sensor
-const int LIMITE_LEITURAS_ESTRANHAS = 3;
+// Mínimo provisório: confirmar na ficha técnica da versão do sensor.
+const float DISTANCIA_MIN_SENSOR = 25.0;
+const float MARGEM_DISTANCIA_VAZIA = 5.0;
+const float DISTANCIA_MAX_VALIDA = DISTANCIA_VAZIA + MARGEM_DISTANCIA_VAZIA;
+
+// Intervalo entre disparos para evitar interferência do eco anterior.
+const unsigned long INTERVALO_AMOSTRAS = 70;
+
+const unsigned long TIMEOUT_WIFI = 10000;
+const unsigned long INTERVALO_RECONEXAO_WIFI = 30000;
 
 // Alerta de nível baixo
 const float NIVEL_ALERTA = 50.0;
@@ -66,7 +74,6 @@ enum EstadoSensor {
     ESTADO_INICIANDO,
     ESTADO_OK,
     ESTADO_SUSPEITA,
-    ESTADO_CHEIO_ESTIMADO,
     ESTADO_ERRO
 };
 
@@ -82,11 +89,14 @@ float alturaAguaAtual = 0.0;
 
 bool dadosDisponiveis = false;
 
-int leiturasEstranhas = 0;
+int amostrasValidas = 0;
 
 bool emailAlertaEnviado = false;
 
 unsigned long ultimaMedicaoMillis = 0;
+unsigned long ultimaLeituraValidaMillis = 0;
+unsigned long ultimaTentativaWiFiMillis = 0;
+bool wifiEstavaConectado = false;
 
 // ======================================================
 // CONFIGURAÇÃO DO E-MAIL
@@ -106,9 +116,6 @@ const char* estadoParaTexto() {
 
         case ESTADO_SUSPEITA:
             return "suspeita";
-
-        case ESTADO_CHEIO_ESTIMADO:
-            return "estimado";
 
         case ESTADO_ERRO:
             return "erro";
@@ -185,6 +192,10 @@ float calcularAlturaAgua(float distancia) {
 // ======================================================
 
 bool enviarEmailNivelBaixo() {
+    if (!EMAIL_HABILITADO) {
+        return false;
+    }
+
     if (WiFi.status() != WL_CONNECTED) {
         Serial.println("Nao foi possivel enviar e-mail: Wi-Fi desconectado.");
 
@@ -241,6 +252,10 @@ bool enviarEmailNivelBaixo() {
 // ======================================================
 
 void verificarAlertaEmail() {
+    if (!EMAIL_HABILITADO) {
+        return;
+    }
+
     // ==================================================
     // REARME
     // ==================================================
@@ -280,105 +295,65 @@ void verificarAlertaEmail() {
 void executarMedicao() {
     ultimaMedicaoMillis = millis();
 
-    float distancia = medirDistancia();
-
     Serial.println();
     Serial.println("============================");
     Serial.println("Nova medicao");
 
-    // ==================================================
-    // LEITURA NORMAL
-    // ==================================================
-
-    if (distancia > 0 && distancia <= DISTANCIA_ESTRANHA) {
-        leiturasEstranhas = 0;
-
-        estadoSensor = ESTADO_OK;
-
-        dadosDisponiveis = true;
-
-        distanciaAtual = distancia;
-
-        nivelAtual = calcularNivel(distancia);
-
-        alturaAguaAtual = calcularAlturaAgua(distancia);
-
-        Serial.print("Distancia: ");
-        Serial.print(distanciaAtual, 1);
-        Serial.println(" cm");
-
-        Serial.print("Altura agua: ");
-        Serial.print(alturaAguaAtual, 1);
-        Serial.println(" cm");
-
-        Serial.print("Nivel: ");
-        Serial.print(nivelAtual, 1);
-        Serial.println(" %");
-
-        verificarAlertaEmail();
-
-        return;
-    }
-
-    // ==================================================
-    // LEITURA MUITO ALTA
-    // ==================================================
-
-    if (distancia > DISTANCIA_ESTRANHA) {
-        leiturasEstranhas++;
-
-        estadoSensor = ESTADO_SUSPEITA;
-
-        distanciaAtual = distancia;
-
-        Serial.print("Leitura suspeita: ");
-
-        Serial.print(distancia, 1);
-
-        Serial.println(" cm");
-
-        Serial.print("Contagem: ");
-
-        Serial.print(leiturasEstranhas);
-
-        Serial.print("/");
-
-        Serial.println(LIMITE_LEITURAS_ESTRANHAS);
-
-        // ==============================================
-        // TRÊS LEITURAS SUSPEITAS CONSECUTIVAS
-        // ==============================================
-
-        if (leiturasEstranhas >= LIMITE_LEITURAS_ESTRANHAS) {
-            estadoSensor = ESTADO_CHEIO_ESTIMADO;
-
-            dadosDisponiveis = true;
-
-            nivelAtual = 100.0;
-
-            alturaAguaAtual = ALTURA_AGUA;
-
-            Serial.println("Caixa considerada CHEIA.");
-
-            Serial.println("Nivel = 100% (estimado)");
-
-            // Se anteriormente houve alerta,
-            // 100% rearma o sistema
-            verificarAlertaEmail();
+    float leituras[TOTAL_AMOSTRAS_MEDICAO];
+    for (int i = 0; i < TOTAL_AMOSTRAS_MEDICAO; i++) {
+        leituras[i] = medirDistancia();
+        Serial.print("Amostra ");
+        Serial.print(i + 1);
+        Serial.print(": ");
+        if (leituras[i] < 0.0f) {
+            Serial.println("sem eco");
+        } else {
+            Serial.print(leituras[i], 1);
+            Serial.println(" cm");
         }
 
+        if (i < TOTAL_AMOSTRAS_MEDICAO - 1) {
+            delay(INTERVALO_AMOSTRAS);
+            server.handleClient();
+        }
+    }
+
+    const ResultadoMedicao resultado =
+        filtrarMediana(leituras, DISTANCIA_MIN_SENSOR, DISTANCIA_MAX_VALIDA);
+    amostrasValidas = resultado.amostrasValidas;
+
+    Serial.print("Amostras validas: ");
+    Serial.print(amostrasValidas);
+    Serial.print("/");
+    Serial.println(TOTAL_AMOSTRAS_MEDICAO);
+
+    if (resultado.distancia < 0.0f) {
+        estadoSensor = resultado.ecosRecebidos == 0 ? ESTADO_ERRO : ESTADO_SUSPEITA;
+        Serial.println(resultado.ecosRecebidos == 0
+                           ? "ERRO: nenhum eco recebido."
+                           : "Sem leitura confiavel: poucas amostras na faixa valida.");
+        // Preserva juntos os valores e o horário da última leitura válida.
         return;
     }
 
-    // ==================================================
-    // TIMEOUT / SEM ECO
-    // ==================================================
+    distanciaAtual = resultado.distancia;
+    nivelAtual = calcularNivel(distanciaAtual);
+    alturaAguaAtual = calcularAlturaAgua(distanciaAtual);
+    ultimaLeituraValidaMillis = millis();
+    dadosDisponiveis = true;
+    estadoSensor = ESTADO_OK;
 
-    estadoSensor = ESTADO_ERRO;
+    Serial.print("Distancia filtrada: ");
+    Serial.print(distanciaAtual, 1);
+    Serial.println(" cm");
+    Serial.print("Altura agua: ");
+    Serial.print(alturaAguaAtual, 1);
+    Serial.println(" cm");
+    Serial.print("Nivel: ");
+    Serial.print(nivelAtual, 1);
+    Serial.println(" %");
 
-    leiturasEstranhas = 0;
-
-    Serial.println("ERRO: nenhum eco recebido.");
+    verificarAlertaEmail();
 }
 
 // ======================================================
@@ -497,11 +472,10 @@ body {
   color: #f87171;
 }
 
-.status.estimated {
-  background:
-    rgba(56,189,248,0.2);
-
-  color: #38bdf8;
+.calibration-warning {
+  color: #fbbf24;
+  font-size: 14px;
+  margin: 0 0 20px;
 }
 
 .content {
@@ -749,6 +723,11 @@ body {
   </div>
 
 
+  <p id="calibrationWarning" class="calibration-warning" hidden>
+    A distância configurada com a caixa cheia está abaixo do mínimo do sensor.
+    Parte do nível alto ficará sem leitura confiável. Ajuste a montagem e a calibração.
+  </p>
+
   <div class="content">
 
     <div class="tank-wrapper">
@@ -824,7 +803,7 @@ body {
         <div class="card">
 
           <div class="card-title">
-            ÚLTIMA MEDIÇÃO
+            ÚLTIMA LEITURA VÁLIDA
           </div>
 
           <div
@@ -928,7 +907,7 @@ function atualizarStatus(data) {
   const status =
     document.getElementById("status");
 
-  if (data.estado === "ok") {
+  if (data.estado === "ok" && data.leituraValida) {
 
     status.innerHTML =
       "● Sensor OK";
@@ -941,29 +920,29 @@ function atualizarStatus(data) {
   else if (data.estado === "suspeita") {
 
     status.innerHTML =
-      "● Leitura suspeita "
-      + data.leiturasEstranhas
-      + "/3";
+      "● Sem leitura confiável ("
+      + data.amostrasValidas
+      + "/" + data.totalAmostras + " amostras válidas)";
 
     status.className =
       "status warning";
 
   }
 
-  else if (data.estado === "estimado") {
+  else if (data.estado === "ok") {
 
     status.innerHTML =
-      "● Caixa cheia (estimado)";
+      "● Leitura desatualizada";
 
     status.className =
-      "status estimated";
+      "status warning";
 
   }
 
   else if (data.estado === "erro") {
 
     status.innerHTML =
-      "● Erro no sensor";
+      "● Sem eco do sensor";
 
     status.className =
       "status error";
@@ -1003,6 +982,7 @@ function atualizarDados() {
     data => {
 
       atualizarStatus(data);
+      document.getElementById("calibrationWarning").hidden = !data.alertaCalibracao;
 
       // =================================================
       // DADOS DISPONÍVEIS
@@ -1044,25 +1024,43 @@ function atualizarDados() {
           + " cm";
 
         atualizarCor(nivel);
+      } else {
+        document.getElementById("mainLevel").textContent = "--%";
+        document.getElementById("tankLevel").textContent = "--%";
+        document.getElementById("waterHeight").textContent = "-- cm";
+        document.getElementById("distance").textContent = "-- cm";
+        document.getElementById("water").style.height = "0%";
       }
 
+      ["mainLevel", "tankLevel", "waterHeight", "distance", "water"].forEach(id => {
+        document.getElementById(id).style.opacity = data.leituraValida ? "1" : "0.5";
+      });
 
       // =================================================
-      // ÚLTIMA MEDIÇÃO
+      // ÚLTIMA LEITURA VÁLIDA
       // =================================================
 
       document.getElementById(
         "lastMeasurement"
       ).innerHTML =
-        data.segundosDesdeMedicao
-        + " s atrás";
+        data.temDados
+          ? data.segundosDesdeMedicao + " s atrás"
+            + (data.leituraValida ? "" : " (desatualizada)")
+          : "Nenhuma leitura válida";
 
 
       // =================================================
       // E-MAIL
       // =================================================
 
-      if (data.emailEnviado) {
+      if (!data.emailHabilitado) {
+
+        document.getElementById(
+          "emailStatus"
+        ).innerHTML =
+          "Desativado para testes";
+
+      } else if (data.emailEnviado) {
 
         document.getElementById(
           "emailStatus"
@@ -1093,6 +1091,11 @@ function atualizarDados() {
 
       status.className =
         "status error";
+
+      ["mainLevel", "tankLevel", "waterHeight", "distance", "water"].forEach(id => {
+        document.getElementById(id).style.opacity = "0.5";
+      });
+      document.getElementById("lastMeasurement").textContent = "Sem conexão para atualizar";
 
     }
   );
@@ -1151,7 +1154,7 @@ function reiniciarESP() {
 atualizarDados();
 
 // Página consulta o ESP32 a cada 2 segundos.
-// Isso NÃO significa que o sensor mede a cada 2 segundos.
+// A medição do sensor segue INTERVALO_MEDICAO, definido no firmware.
 setInterval(
   atualizarDados,
   2000
@@ -1181,29 +1184,31 @@ void configurarServidor() {
     // ==================================================
 
     server.on("/dados", HTTP_GET, []() {
-        unsigned long segundosDesdeMedicao = (millis() - ultimaMedicaoMillis) / 1000;
+        const unsigned long idadeLeitura = millis() - ultimaLeituraValidaMillis;
+        const bool leituraValida = dadosDisponiveis && estadoSensor == ESTADO_OK &&
+                                   idadeLeitura <= INTERVALO_MEDICAO * 3;
 
         String json;
 
-        json.reserve(300);
+        json.reserve(400);
 
         json += "{";
 
         json += "\"distancia\":";
 
-        json += String(distanciaAtual, 1);
+        json += (dadosDisponiveis ? String(distanciaAtual, 1) : String("null"));
 
         json += ",";
 
         json += "\"nivel\":";
 
-        json += String(nivelAtual, 1);
+        json += (dadosDisponiveis ? String(nivelAtual, 1) : String("null"));
 
         json += ",";
 
         json += "\"altura\":";
 
-        json += String(alturaAguaAtual, 1);
+        json += (dadosDisponiveis ? String(alturaAguaAtual, 1) : String("null"));
 
         json += ",";
 
@@ -1219,15 +1224,39 @@ void configurarServidor() {
 
         json += ",";
 
-        json += "\"leiturasEstranhas\":";
+        json += "\"leituraValida\":";
 
-        json += String(leiturasEstranhas);
+        json += (leituraValida ? "true" : "false");
+
+        json += ",";
+
+        json += "\"alertaCalibracao\":";
+
+        json += (DISTANCIA_CHEIA < DISTANCIA_MIN_SENSOR ? "true" : "false");
+
+        json += ",";
+
+        json += "\"amostrasValidas\":";
+
+        json += String(amostrasValidas);
+
+        json += ",";
+
+        json += "\"totalAmostras\":";
+
+        json += String(TOTAL_AMOSTRAS_MEDICAO);
 
         json += ",";
 
         json += "\"segundosDesdeMedicao\":";
 
-        json += String(segundosDesdeMedicao);
+        json += (dadosDisponiveis ? String(idadeLeitura / 1000) : String("null"));
+
+        json += ",";
+
+        json += "\"emailHabilitado\":";
+
+        json += (EMAIL_HABILITADO ? "true" : "false");
 
         json += ",";
 
@@ -1262,6 +1291,30 @@ void configurarServidor() {
 // SETUP
 // ======================================================
 
+void manterWiFi() {
+    const bool conectado = WiFi.status() == WL_CONNECTED;
+    if (conectado) {
+        if (!wifiEstavaConectado) {
+            Serial.println("Wi-Fi conectado!");
+            Serial.print("Endereco IP: ");
+            Serial.println(WiFi.localIP());
+        }
+        wifiEstavaConectado = true;
+        return;
+    }
+
+    if (wifiEstavaConectado) {
+        Serial.println("Wi-Fi desconectado. Medicoes continuam pelo serial.");
+    }
+    wifiEstavaConectado = false;
+
+    if (millis() - ultimaTentativaWiFiMillis >= INTERVALO_RECONEXAO_WIFI) {
+        ultimaTentativaWiFiMillis = millis();
+        Serial.println("Tentando reconectar ao Wi-Fi...");
+        WiFi.reconnect();
+    }
+}
+
 void setup() {
     Serial.begin(115200);
 
@@ -1270,6 +1323,11 @@ void setup() {
     pinMode(ECHO_PIN, INPUT);
 
     digitalWrite(TRIG_PIN, LOW);
+
+    if (DISTANCIA_CHEIA < DISTANCIA_MIN_SENSOR) {
+        Serial.println("ATENCAO: distancia com caixa cheia abaixo do minimo do sensor.");
+        Serial.println("Parte do nivel alto ficara sem leitura confiavel. Ajuste montagem e calibracao.");
+    }
 
     // ==================================================
     // WI-FI
@@ -1287,19 +1345,20 @@ void setup() {
     Serial.print("Conectando ao Wi-Fi");
 
     WiFi.begin(ssid, password);
+    ultimaTentativaWiFiMillis = millis();
 
-    while (WiFi.status() != WL_CONNECTED) {
+    while (WiFi.status() != WL_CONNECTED &&
+           millis() - ultimaTentativaWiFiMillis < TIMEOUT_WIFI) {
         delay(500);
 
         Serial.print(".");
     }
 
     Serial.println();
-    Serial.println("Wi-Fi conectado!");
-
-    Serial.print("Endereco IP: ");
-
-    Serial.println(WiFi.localIP());
+    manterWiFi();
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("Wi-Fi indisponivel. Medicoes continuam pelo serial.");
+    }
 
     // ==================================================
     // SERVIDOR
@@ -1309,13 +1368,13 @@ void setup() {
 
     server.begin();
 
-    Serial.println("Servidor WEB iniciado!");
+    Serial.println("Servidor WEB iniciado. Dashboard disponivel quando o Wi-Fi conectar.");
 
     // ==================================================
     // PRIMEIRA MEDIÇÃO
     // ==================================================
 
-    // Não espera 30 segundos após ligar.
+    // Faz a primeira medição antes de entrar no loop principal.
     executarMedicao();
 }
 
@@ -1324,11 +1383,13 @@ void setup() {
 // ======================================================
 
 void loop() {
+    manterWiFi();
+
     // Mantém o servidor WEB respondendo continuamente
     server.handleClient();
 
     // ==================================================
-    // MEDIÇÃO A CADA 30 SEGUNDOS
+    // MEDIÇÃO NO INTERVALO CONFIGURADO
     // ==================================================
 
     if (millis() - ultimaMedicaoMillis >= INTERVALO_MEDICAO) {
